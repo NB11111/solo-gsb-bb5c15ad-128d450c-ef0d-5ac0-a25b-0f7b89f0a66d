@@ -4,7 +4,7 @@ import { DEFAULT_VALIDATE_SAMPLE } from "../defaultSamples";
 
 const TARGET_META = {
   infer: "按样本归纳出的契约校验",
-  variant: "按事件变体契约（oneOf 分支）校验",
+  variant: "按事件变体契约 / 增强 Schema（dependentRequired、not/required）校验",
 };
 
 export default function ValidatePanel({ schema, variantSchema, target = "infer", onTargetChange }) {

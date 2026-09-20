@@ -691,8 +691,134 @@ test("POST /api/migrate validates its input", async () => {
   assert.match(invalidSchema.data.error, /Invalid schema/);
 });
 
-test("malformed JSON body gets a JSON 400", async () => {
-  const res = await fetch(`${base}/api/infer`, {
+test("POST /api/relation/mine finds implication and mutex candidates", async () => {
+  const res = await post("/api/relation/mine", {
+    samples: [
+      { phone: "1", a: 1, b: 1 },
+      { email: "e", a: 2, b: 2 },
+      { phone: "2", b: 3 },
+      { email: "f" },
+    ],
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.data.sampleCount, 4);
+  assert.equal(res.data.minSupport, 2);
+  const mutex = res.data.rules.find(
+    (r) => r.kind === "mutex" && r.a === "email" && r.b === "phone"
+  );
+  assert.ok(mutex);
+  assert.equal(mutex.support, 2);
+  assert.equal(mutex.confidence, 1);
+  assert.deepEqual(mutex.observationPaths.both, []);
+  // a -> b is a true implication (b also appears alone in sample 3).
+  const imp = res.data.rules.find((r) => r.kind === "implication" && r.a === "a" && r.b === "b");
+  assert.ok(imp);
+});
+
+test("POST /api/relation/mine scopes array elements independently", async () => {
+  const res = await post("/api/relation/mine", {
+    samples: [{ list: [{ a: 1, b: 1 }, { a: 2 }, { b: 3 }] }],
+  });
+  assert.equal(res.status, 200);
+  // Only one co-occurrence inside the elements -> no relation qualifies.
+  assert.equal(res.data.rules.length, 0);
+  // But the element scope itself is present.
+  assert.equal(res.data.scopeCount, 2); // root + /properties/list/items
+});
+
+test("POST /api/relation/mine validates its input", async () => {
+  const missing = await post("/api/relation/mine", {});
+  assert.equal(missing.status, 400);
+  assert.match(missing.data.error, /'samples' array/);
+
+  const empty = await post("/api/relation/mine", { samples: [] });
+  assert.equal(empty.status, 400);
+
+  const tooMany = await post("/api/relation/mine", {
+    samples: Array.from({ length: 201 }, () => ({ a: 1 })),
+  });
+  assert.equal(tooMany.status, 400);
+  assert.match(tooMany.data.error, /200/);
+});
+
+test("POST /api/relation/enhance builds dependentRequired/not+required and re-verifies", async () => {
+  const samples = [
+    { phone: "1" },
+    { email: "e" },
+    { phone: "2" },
+    { email: "f" },
+  ];
+  const mined = await post("/api/relation/mine", { samples });
+  const mutex = mined.data.rules.find((r) => r.kind === "mutex");
+  const inferred = await post("/api/infer", { samples });
+
+  const res = await post("/api/relation/enhance", {
+    schema: inferred.data.schema,
+    samples,
+    ruleIds: [mutex.id],
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.data.ruleCount, 1);
+  assert.deepEqual(res.data.schema.allOf, [{ not: { required: ["email", "phone"] } }]);
+  assert.equal(res.data.sampleCount, 4);
+
+  // The enhanced schema actually rejects a sample carrying both fields.
+  const check = await post("/api/validate", {
+    schema: res.data.schema,
+    sample: { phone: "x", email: "y" },
+  });
+  assert.equal(check.data.valid, false);
+});
+
+test("POST /api/relation/enhance refuses with 422 + failures when a sample breaks", async () => {
+  const samples = [
+    { phone: "x" },
+    { email: "y" },
+    { phone: "z" },
+    { email: "w" },
+  ];
+  const mined = await post("/api/relation/mine", { samples });
+  const mutex = mined.data.rules.find((r) => r.kind === "mutex");
+  const res = await post("/api/relation/enhance", {
+    schema: {
+      type: "object",
+      properties: { phone: { type: "integer" }, email: { type: "string" } },
+    },
+    samples,
+    ruleIds: [mutex.id],
+  });
+  assert.equal(res.status, 422);
+  assert.match(res.data.error, /未产出增强 Schema/);
+  assert.ok(res.data.failures.length >= 1);
+  assert.equal(res.data.schema, undefined);
+});
+
+test("POST /api/relation/enhance rejects unknown rule ids and bad input with 400", async () => {
+  const badId = await post("/api/relation/enhance", {
+    schema: {},
+    samples: [{ a: 1 }, { a: 2 }],
+    ruleIds: ["r999"],
+  });
+  assert.equal(badId.status, 400);
+  assert.equal(badId.data.invalidRules.length, 1);
+
+  const noSchema = await post("/api/relation/enhance", { samples: [{}], ruleIds: ["r1"] });
+  assert.equal(noSchema.status, 400);
+
+  const noRules = await post("/api/relation/enhance", { schema: {}, samples: [{}] });
+  assert.equal(noRules.status, 400);
+  assert.match(noRules.data.error, /'ruleIds' array/);
+
+  const tooMany = await post("/api/relation/enhance", {
+    schema: {},
+    samples: Array.from({ length: 201 }, () => ({})),
+    ruleIds: ["r1"],
+  });
+  assert.equal(tooMany.status, 400);
+  assert.match(tooMany.data.error, /200/);
+});
+
+test("malformed JSON body gets a JSON 400", async () => {  const res = await fetch(`${base}/api/infer`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: "{not json",

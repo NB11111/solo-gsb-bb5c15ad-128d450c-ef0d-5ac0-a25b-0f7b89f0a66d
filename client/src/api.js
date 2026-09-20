@@ -58,3 +58,11 @@ export function sliceContract(schema, samples, pointers) {
 export function migrateSamples(baselineSchema, currentSchema, samples, mappings) {
   return request("/api/migrate", { baselineSchema, currentSchema, samples, mappings });
 }
+
+export function mineFieldRelations(samples) {
+  return request("/api/relation/mine", { samples });
+}
+
+export function buildEnhancedSchema(schema, samples, ruleIds) {
+  return request("/api/relation/enhance", { schema, samples, ruleIds });
+}
