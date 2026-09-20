@@ -12,6 +12,7 @@ const { buildVariantContract } = require("./variant");
 const { anonymizeSamples } = require("./anonymize");
 const { buildSlice } = require("./slice");
 const { migrateSamples } = require("./migrate");
+const { mineRelations, enhanceSchema } = require("./relation");
 
 function createApp() {
   const app = express();
@@ -196,6 +197,35 @@ function createApp() {
     const { baselineSchema, currentSchema, samples, mappings } = req.body || {};
     try {
       res.json(migrateSamples({ baselineSchema, currentSchema, samples, mappings }));
+    } catch (err) {
+      const status = err.status && err.status < 500 ? err.status : 500;
+      res.status(status).json({
+        error: status === 500 ? "Internal server error" : err.message,
+        ...(err.details || {}),
+      });
+    }
+  });
+
+  // Field relation mining: collect per-object-scope field presence across
+  // all samples and report support>=2 / confidence 100% implication and
+  // exclusion candidates (implications transitively reduced).
+  app.post("/api/relation/mine", (req, res) => {
+    const { samples, schema } = req.body || {};
+    try {
+      res.json(mineRelations({ samples, schema }));
+    } catch (err) {
+      const status = err.status && err.status < 500 ? err.status : 500;
+      res.status(status).json({ error: status === 500 ? "Internal server error" : err.message });
+    }
+  });
+
+  // Build the enhanced schema (dependentRequired + not/required) for the
+  // picked rules and re-validate every original sample with Ajv; a single
+  // failure refuses the run without producing a schema.
+  app.post("/api/relation/enhance", (req, res) => {
+    const { schema, samples, ruleIds } = req.body || {};
+    try {
+      res.json(enhanceSchema({ schema, samples, ruleIds }));
     } catch (err) {
       const status = err.status && err.status < 500 ? err.status : 500;
       res.status(status).json({

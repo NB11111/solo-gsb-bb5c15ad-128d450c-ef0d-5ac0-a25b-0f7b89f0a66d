@@ -18,7 +18,11 @@
 还可配置多条 **JSON Pointer 规则**对样本做**匿名化导出**——命中标量被替换为跨样本稳定、
 保留 JSON 类型的假名，先预览各规则命中情况再一键复制；
 也可在 Schema 树勾选 1～20 个节点生成**契约切片**——仅保留所选节点及必要祖先结构的独立
-Schema，并同步投影当前样本（后端用 Ajv 逐条校验投影，任一失败则不产出）。
+Schema，并同步投影当前样本（后端用 Ajv 逐条校验投影，任一失败则不产出）；
+还可做**字段关系挖掘**——在每个对象 Pointer 作用域内统计字段出现集合（数组元素按元素独立计数、
+不跨作用域关联），找出支持数 ≥ 2、置信度 100% 的「出现 A 必出现 B」与「A/B 互斥」候选（蕴含做
+传递约简），勾选后生成加入 `dependentRequired`、`not/required` 组合的增强 Schema（全部原样本经
+Ajv 复验通过才产出）。
 
 技术栈：Node.js · Express · React（Vite）· Ajv（draft 2020-12）
 
@@ -347,6 +351,52 @@ Schema），或直接调用 `POST /api/slice`。在 Schema 树勾选 1～20 个�
 - 选择或样本有任何变化，上次切片结果立即失效，需重新生成。
 - 单次最多 200 条样本、20 个 Pointer；超限时接口返回 `400` 及明确错误信息。
 
+## 字段关系挖掘：规则与入口
+
+入口：**http://localhost:8080** 页面的「⑦ 字段关系」页签（需先在「① 样本输入」归纳出
+Schema），或直接调用 `POST /api/relation/mine` 与 `POST /api/relation/enhance`。
+
+**作用域统计（禁止跨作用域关联）**：
+
+- 每个对象实例是一个独立的**对象 Pointer 作用域**：根样本为对象时属于根作用域（Pointer `""`），
+  对象属性形成 `/properties/<键>` 作用域，数组的**每个对象元素**各自独立计入同一个
+  `/items` 作用域（同一数组两个元素就是两个独立观测）。
+- 父对象的字段与数组元素内的字段、不同数组元素的字段之间**绝不关联**；样本在该位置是
+  标量 / null（类型并集情形）时该作用域不计入。
+- 每个作用域统计：对象总数、各字段出现次数、字段同时出现 / 不共现关系；观测路径形如
+  `#/<样本序号>/<路径>`（如 `#/0/list/2/a`），数组下标逐段保留。
+
+**候选规则（支持数 ≥ 2、置信度 100%）**：
+
+| 类型 | 条件（同一作用域内） | 支持数 |
+| --- | --- | --- |
+| 蕴含 A → B | 所有含 A 的作用域都含 B（无反例） | 含 A 的作用域数 |
+| 互斥 A / B | 不存在任何作用域同时含 A、B | min(含 A 数, 含 B 数) |
+
+- 阈值两侧（含 A、含 B）都须 ≥ 2；互斥要求共现数为 0，蕴含要求置信度严格 100%。
+- **蕴含做传递约简**：每个作用域内把蕴含关系视为有向图，强连通分量（互为蕴含，即字段出现
+  集合完全相同）保留一条覆盖全部分量的有向环，分量间的 DAG 边若可被 ≥ 2 条边的路径推导则
+  删除；结果区展示约简去除的边数。
+- 已被归纳 Schema 的 `required` 天然覆盖的蕴含（目标字段本就必填）会标注「已被 required
+  覆盖」，默认不参与增强、仅折叠展示。
+
+**观测路径与支持样本**：每条规则展示规则形式、作用域 Pointer、支持数 / 作用域总数
+（互斥另显示两侧出现数与共现 0）、支持样本序号（点击可定位到原始样本编辑器）与全部观测路径
+（超过 50 条截断提示）；互斥分别列出含 A 与含 B 两侧的路径。
+
+**增强 Schema 与 Ajv 复验**：勾选候选后点击「生成增强 Schema」：
+
+- 蕴含 A → B 注入该作用域 Schema 节点的 `dependentRequired: { A: ["B"] }`（同一前件的多条
+  规则合并为一个数组）；互斥 A / B 注入 `allOf: [{ not: { required: ["A", "B"] } }]`
+  （多条互斥各自成为 `allOf` 的一项，可并存）。
+- 后端在生成后用 Ajv 对**全部原样本**复验：**任一样本不通过则不产出**（HTTP 422），响应
+  携带失败样本索引（`failures[].index`）与完整 Ajv 错误；所选规则因样本变化失效（重挖后
+  找不到该规则 id）同样 422 拒绝并逐条列出。
+- 成功后可一键复制增强 Schema，或「在校验页验证 →」切到「③ 校验新样本」以该 Schema 为
+  校验目标；任何样本或勾选变化都会使上次增强结果失效。
+- 单次最多 200 条样本；样本集非数组 / 为空、规则 id 非字符串返回 400，Schema 无法编译或
+  复验失败返回 422。
+
 ## 本地开发
 
 ```bash
@@ -360,7 +410,7 @@ npm run dev:client   # 前端 http://localhost:5173（/api 代理到 8080）
 ## 测试
 
 ```bash
-npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、样本贡献度、事件变体契约、匿名化导出、契约切片、历史样本迁移、HTTP API 与发布门禁（188 项）
+npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、样本贡献度、事件变体契约、匿名化导出、契约切片、历史样本迁移、字段关系挖掘、HTTP API 与发布门禁（222 项）
 ```
 
 ## API
@@ -378,6 +428,8 @@ npm test             # node:test，覆盖归纳引擎、契约比较器、反例
 | POST | `/api/anonymize` | `{ samples: [<any>, ...], rules: ["/email", "/tags/*"] }`（≤ 200 条） | `{ totalSamples, rules: [{ index, pattern, status, hits, paths, pathsTruncated, error }], samples: [<匿名化样本>] }`；非法 Pointer、命中对象/数组或规则间路径冲突时返回 422，响应体仍携带各规则统计 |
 | POST | `/api/slice` | `{ schema: {...}, samples: [<any>, ...], pointers: ["/properties/a", "/properties/tags/items"] }`（样本 ≤ 200 条，Pointer 1–20 个，`""` 表示根） | `{ schema, samples, fieldCount, sampleCount, pointers, ignored: [{ pointer, reason }] }`；Pointer 非法/未命中返回 422 并携带 `invalidPointers`，任一投影样本未通过 Ajv 校验返回 422 并携带 `failures: [{ index, errors }]`，均不产出切片 |
 | POST | `/api/migrate` | `{ baselineSchema?: {...}, currentSchema: {...}, samples: [<any>, ...]（≤ 200）, mappings: [{ from: "/a", to: "/b", default?: <JSON> }] }`（源可用 `""` 表示根；目标末段 `-` 追加数组） | `{ total, summary: { success, conflict, invalid }, plan: { sourceRemovals: [{ mapping, pointer }], targetWrites: [{ mapping, pointer }] }, mappings: [{ index, from, to, hasDefault }], samples: [{ index, status, before, after, reasons, operations: [{ kind, from?, to, reason? }], baseline: { valid, errors }?, current: { valid, errors } }] }`；映射语义非法（非法 Pointer、目标为根、源目标相同、源重复、目标父子重叠、`-` 位置错误）返回 422 并携带 `invalidMappings`，冲突样本 `after` 为 `null` 且保持原样 |
+| POST | `/api/relation/mine` | `{ samples: [<any>, ...]（≤ 200）, schema?: {...} }`（schema 可选，传入时标注已被 `required` 覆盖的蕴含） | `{ sampleCount, scopeCount, minSupport: 2, summary: { implication, exclusion, removedByTransitiveReduction }, scopes: [{ scopePointer, scopeCount, fields: [{ name, count }], implications: [{ id, kind, scopePointer, a, b, support, scopeCount, confidence, sampleIndexes, witnessPaths, witnessPathsTruncated, alreadyEnforced }], exclusions: [{ id, kind, scopePointer, a, b, support, countA, countB, coOccurrence, scopeCount, confidence, sampleIndexes, witnessPathsA, witnessPathsB, witnessPathsTruncated }] }] }` |
+| POST | `/api/relation/enhance` | `{ schema: {...}, samples: [<any>, ...]（≤ 200）, ruleIds: ["implication\|\|a->b", "exclusion\|\|a<x>b"] }` | `{ schema, sampleCount, ruleCount, ruleIds, rules }`；规则 id 失效返回 422 并携带 `invalidRules`；任一原样本未通过增强 Schema 的 Ajv 复验返回 422 并携带 `failures: [{ index, errors }]`，均不产出 Schema |
 
 示例：
 
@@ -530,6 +582,42 @@ curl -X POST http://localhost:8080/api/migrate \
 #    默认值照常补入；目标已存在且未被源移动覆盖的样本会归为 conflict 并保持原样
 ```
 
+挖掘字段关系并生成增强 Schema（蕴含 → dependentRequired，互斥 → not/required，原样本全部复验）：
+
+```bash
+# 1) 挖掘候选（数组元素各自独立计入 /items 作用域，不跨作用域关联）
+curl -s -X POST http://localhost:8080/api/relation/mine \
+  -H 'Content-Type: application/json' \
+  -d '{"samples":[
+        {"kind":"created","at":"2026-01-01"},
+        {"kind":"created","at":"2026-01-02"},
+        {"kind":"deleted","reason":"spam"},
+        {"kind":"deleted","reason":"dup"}]}'
+# -> { "scopeCount": 4, "summary": { "implication": 2, "exclusion": 1, ... },
+#      "scopes": [{ "scopePointer": "",
+#        "implications": [{ "id": "implication||at->kind", "support": 2, ... },
+#                         { "id": "implication||reason->kind", "support": 2, ... }],
+#        "exclusions":   [{ "id": "exclusion||at<x>reason", "support": 2,
+#                           "witnessPathsA": ["#/0", "#/1"],
+#                           "witnessPathsB": ["#/2", "#/3"], ... }] }] }
+
+# 2) 勾选互斥规则生成增强 Schema（后端重挖校验规则 id，并用 Ajv 复验全部原样本）
+curl -s -X POST http://localhost:8080/api/relation/enhance \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"type":"object",
+                  "properties":{"kind":{"type":"string"},"at":{"type":"string"},"reason":{"type":"string"}},
+                  "required":["kind"]},
+       "samples":[
+         {"kind":"created","at":"2026-01-01"},
+         {"kind":"created","at":"2026-01-02"},
+         {"kind":"deleted","reason":"spam"},
+         {"kind":"deleted","reason":"dup"}],
+       "ruleIds":["exclusion||at<x>reason"]}'
+# -> { "ruleCount": 1, "sampleCount": 4,
+#      "schema": { ..., "allOf": [{ "not": { "required": ["at", "reason"] } }] } }
+# —— 任一样本复验失败（或规则 id 已失效）时返回 422 且不产出 schema
+```
+
 ## 目录结构
 
 ```
@@ -546,7 +634,8 @@ curl -X POST http://localhost:8080/api/migrate \
 │   ├── anonymize.js        # 匿名化导出（JSON Pointer + 单段 * 通配递归匹配，跨样本稳定、类型保留的假名替换，单次上限 200 条）
 │   ├── slice.js            # 契约切片（按勾选的 Schema 树 Pointer 裁剪结构 + 投影样本 + Ajv 逐条校验，样本上限 200 条、Pointer 上限 20 个）
 │   ├── migrate.js          # 历史样本迁移（按路径深度规划源移除/目标写入 + 逐样本原子移动/补值，数组、父子重叠、目标冲突处理 + Ajv 按当前 Schema 校验，上限 200 条）
-│   ├── app.js              # Express（/api/infer、/api/validate、/api/diff、/api/counterexample、/api/scan、/api/contribution、/api/variant、/api/anonymize、/api/slice、/api/migrate、静态托管）
+│   ├── relation.js         # 字段关系挖掘（按对象 Pointer 作用域统计字段出现，数组元素独立计数，支持≥2/置信100% 蕴含与互斥 + 蕴含传递约简；增强 Schema 注入 dependentRequired / not+required 并用全部原样本 Ajv 复验）
+│   ├── app.js              # Express（/api/infer、/api/validate、/api/diff、/api/counterexample、/api/scan、/api/contribution、/api/variant、/api/anonymize、/api/slice、/api/migrate、/api/relation/mine、/api/relation/enhance、静态托管）
 │   ├── index.js            # 入口：监听 PORT（默认 8080）
 │   └── test/               # node:test 单元与 API 测试
 └── client/
@@ -563,6 +652,7 @@ curl -X POST http://localhost:8080/api/migrate \
         ├── components/ContributionPanel.jsx # 样本贡献度：留一法分析入口、关键/冗余汇总筛选、定位原样本
         ├── components/AnonymizePanel.jsx    # 匿名化导出：规则编辑、命中/未命中/错误预览、复制匿名化样本
         ├── components/SlicePanel.jsx        # 契约切片：可勾选 Schema 树、字段数/样本数预览、分别复制切片 Schema 与投影样本
+        ├── components/RelationPanel.jsx     # 字段关系：按作用域展示蕴含/互斥候选、观测路径与支持样本（可定位），勾选生成 Ajv 复验后的增强 Schema
         ├── components/VariantPanel.jsx    # 事件变体：判别 Pointer 输入、分组/跳过明细、分支 Schema、复制与接入校验
         ├── components/ReleaseGate.jsx   # 发布门禁卡片：版本输入、放行结论、报告复制
         └── components/SampleEditor.jsx  # 样本编辑器（实时 JSON 校验）

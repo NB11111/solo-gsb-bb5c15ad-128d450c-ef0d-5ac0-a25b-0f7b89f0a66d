@@ -691,8 +691,167 @@ test("POST /api/migrate validates its input", async () => {
   assert.match(invalidSchema.data.error, /Invalid schema/);
 });
 
-test("malformed JSON body gets a JSON 400", async () => {
-  const res = await fetch(`${base}/api/infer`, {
+test("POST /api/relation/mine reports implication and exclusion candidates per scope", async () => {
+  const samples = [
+    { id: 1, phone: "a", home: "h" },
+    { id: 2, phone: "b", home: "i" },
+    { id: 3, work: "w" },
+    { id: 4, work: "x" },
+  ];
+  const { data: inferred } = await post("/api/infer", { samples });
+  const res = await post("/api/relation/mine", { samples, schema: inferred.schema });
+  assert.equal(res.status, 200);
+  assert.equal(res.data.sampleCount, 4);
+  assert.equal(res.data.scopeCount, 4);
+  assert.equal(res.data.minSupport, 2);
+  assert.ok(res.data.summary.removedByTransitiveReduction >= 0);
+
+  const root = res.data.scopes.find((g) => g.scopePointer === "");
+  const pairs = root.implications.map((r) => `${r.a}->${r.b}`);
+  assert.ok(pairs.includes("phone->home"));
+  assert.ok(pairs.includes("home->phone"));
+  // phone/home imply the required id; work implies id too but that edge is
+  // already enforced, and work has no implication toward phone/home.
+  assert.equal(pairs.some((p) => p.startsWith("work->phone") || p.startsWith("work->home")), false);
+  assert.equal(pairs.includes("phone->work"), false);
+
+  const exclusions = root.exclusions.map((r) => `${r.a}/${r.b}`).sort();
+  assert.deepEqual(exclusions, ["home/work", "phone/work"]);
+  const phoneWork = root.exclusions.find((r) => r.a === "phone" && r.b === "work");
+  assert.equal(phoneWork.support, 2);
+  assert.deepEqual(phoneWork.witnessPathsA, ["#/0", "#/1"]);
+  assert.deepEqual(phoneWork.witnessPathsB, ["#/2", "#/3"]);
+});
+
+test("POST /api/relation/mine handles array element scopes independently", async () => {
+  const samples = [
+    { list: [{ a: 1, b: 2 }, { a: 3, b: 4 }] },
+    { list: [{ a: 5 }] },
+  ];
+  const res = await post("/api/relation/mine", { samples });
+  assert.equal(res.status, 200);
+  const items = res.data.scopes.find(
+    (g) => g.scopePointer === "/properties/list/items"
+  );
+  assert.equal(items.scopeCount, 3);
+  assert.deepEqual(items.implications.map((r) => `${r.a}->${r.b}`), ["b->a"]);
+  assert.deepEqual(items.implications[0].witnessPaths, ["#/0/list/0", "#/0/list/1"]);
+});
+
+test("POST /api/relation/mine validates its input", async () => {
+  const empty = await post("/api/relation/mine", { samples: [] });
+  assert.equal(empty.status, 400);
+  assert.match(empty.data.error, /'samples' array/);
+
+  const tooMany = await post("/api/relation/mine", {
+    samples: Array.from({ length: 201 }, () => ({})),
+  });
+  assert.equal(tooMany.status, 400);
+  assert.match(tooMany.data.error, /200/);
+
+  const badSchema = await post("/api/relation/mine", { samples: [{}], schema: [] });
+  assert.equal(badSchema.status, 400);
+  assert.match(badSchema.data.error, /'schema' object/);
+});
+
+test("POST /api/relation/enhance builds dependentRequired + not/required and revalidates all samples", async () => {
+  const samples = [
+    { id: 1, a: 1, b: 2 },
+    { id: 2, a: 3, b: 4 },
+    { id: 3, c: true },
+    { id: 4, c: false },
+  ];
+  const { data: inferred } = await post("/api/infer", { samples });
+  const mined = await post("/api/relation/mine", { samples, schema: inferred.schema });
+  const root = mined.data.scopes[0];
+  const ruleIds = [
+    ...root.implications.filter((r) => !r.alreadyEnforced).map((r) => r.id),
+    ...root.exclusions.map((r) => r.id),
+  ];
+
+  const res = await post("/api/relation/enhance", {
+    schema: inferred.schema,
+    samples,
+    ruleIds,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.data.ruleCount, ruleIds.length);
+  assert.equal(res.data.sampleCount, 4);
+  assert.deepEqual(res.data.schema.dependentRequired, { a: ["b"], b: ["a"] });
+  assert.deepEqual(res.data.schema.allOf, [
+    { not: { required: ["a", "c"] } },
+    { not: { required: ["b", "c"] } },
+  ]);
+
+  // The produced schema actually enforces the rules (checked server-side
+  // via /api/validate).
+  const violating = await post("/api/validate", {
+    schema: res.data.schema,
+    sample: { id: 9, a: 1, c: true },
+  });
+  assert.equal(violating.data.valid, false);
+  assert.ok(violating.data.errors.some((e) => e.keyword === "not"));
+});
+
+test("POST /api/relation/enhance refuses 422 and produces no schema when a sample fails Ajv", async () => {
+  const samples = [{ a: 1, b: 2 }, { a: 3, b: 4 }];
+  const res = await post("/api/relation/enhance", {
+    schema: {
+      type: "object",
+      properties: { a: { type: "integer", minimum: 100 }, b: { type: "integer" } },
+    },
+    samples,
+    ruleIds: ["implication||a->b", "implication||b->a"],
+  });
+  assert.equal(res.status, 422);
+  assert.equal(res.data.schema, undefined);
+  assert.match(res.data.error, /复验/);
+  assert.equal(res.data.failures.length, 2);
+  assert.equal(res.data.failures[0].errors[0].keyword, "minimum");
+});
+
+test("POST /api/relation/enhance rejects unknown rule ids with 422 details", async () => {
+  const res = await post("/api/relation/enhance", {
+    schema: { type: "object" },
+    samples: [{}],
+    ruleIds: ["implication||nope->zzz"],
+  });
+  assert.equal(res.status, 422);
+  assert.equal(res.data.schema, undefined);
+  assert.equal(res.data.invalidRules.length, 1);
+  assert.equal(res.data.invalidRules[0].index, 0);
+  assert.match(res.data.invalidRules[0].reason, /失效/);
+});
+
+test("POST /api/relation/enhance validates its input shape", async () => {
+  const noSchema = await post("/api/relation/enhance", {
+    samples: [{}],
+    ruleIds: [],
+  });
+  assert.equal(noSchema.status, 400);
+  assert.match(noSchema.data.error, /'schema' object/);
+
+  const noSamples = await post("/api/relation/enhance", {
+    schema: {},
+    ruleIds: [],
+  });
+  assert.equal(noSamples.status, 400);
+  assert.match(noSamples.data.error, /'samples' array/);
+
+  const noRules = await post("/api/relation/enhance", { schema: {}, samples: [{}] });
+  assert.equal(noRules.status, 400);
+  assert.match(noRules.data.error, /'ruleIds' array/);
+
+  const badId = await post("/api/relation/enhance", {
+    schema: {},
+    samples: [{}],
+    ruleIds: [42],
+  });
+  assert.equal(badId.status, 400);
+  assert.match(badId.data.error, /rule id/);
+});
+
+test("malformed JSON body gets a JSON 400", async () => {  const res = await fetch(`${base}/api/infer`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: "{not json",
